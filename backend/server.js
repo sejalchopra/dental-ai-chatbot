@@ -95,7 +95,7 @@ function auth(req, res, next){
 app.post('/api/chatbot/message', auth, async (req, res) => {
   try {
     const { message, session_id } = req.body || {}
-    if(!message) return res.status(400).json({ error: 'missing message' })
+    if (!message) return res.status(400).json({ error: 'missing message' })
 
     const userId = await upsertUser(req.user?.sub || 'user_1')
     await ensureSession(userId, session_id)
@@ -117,7 +117,8 @@ app.post('/api/chatbot/message', auth, async (req, res) => {
       role: 'assistant',
       content: data?.reply || data?.data?.reply || '',
       meta: data?.appointment_candidate || data?.data?.appointment_candidate
-        ? { appointment_candidate: data?.appointment_candidate || data?.data?.appointment_candidate,
+        ? {
+            appointment_candidate: data?.appointment_candidate || data?.data?.appointment_candidate,
             intent: data?.intent || data?.data?.intent,
             needs_confirmation: data?.needs_confirmation ?? data?.data?.needs_confirmation ?? false
           }
@@ -125,7 +126,7 @@ app.post('/api/chatbot/message', auth, async (req, res) => {
     })
 
     return res.json({ ok: true, data })
-  } catch (e){
+  } catch (e) {
     console.error(e)
     return res.status(500).json({ error: 'failed to reach python service' })
   }
@@ -135,20 +136,49 @@ app.post('/api/chatbot/message', auth, async (req, res) => {
 app.post('/api/chatbot/confirm', auth, async (req, res) => {
   try {
     const { session_id, scheduled_at, confirm } = req.body || {}
-    if(!session_id || !scheduled_at) return res.status(400).json({ error: 'missing session_id or scheduled_at' })
+    if (!session_id || !scheduled_at) {
+      return res.status(400).json({ ok: false, error: 'bad_request', message: 'missing session_id or scheduled_at' })
+    }
+
+    // Validate scheduled_at
+    const ts = Date.parse(scheduled_at)
+    if (Number.isNaN(ts)) {
+      return res.status(400).json({ ok: false, error: 'bad_request', message: 'scheduled_at must be ISO8601' })
+    }
 
     const userId = await upsertUser(req.user?.sub || 'user_1')
     await ensureSession(userId, session_id)
 
-    if(confirm){
-      const ins = await query(
-        `INSERT INTO appointments (user_id, scheduled_at, status, notes)
-         VALUES ($1, $2, 'confirmed', 'Booked via chatbot')
-         RETURNING id, scheduled_at, status, created_at`,
-        [userId, scheduled_at]
-      )
+    // If user declined, just acknowledge
+    if (!confirm) {
+      return res.json({ ok: true, status: 'declined' })
+    }
 
-      // log assistant confirmation message too
+    // 🔒 Conflict check (prevent double-booking)
+    const conflict = await query(
+      `SELECT 1 FROM appointments
+       WHERE scheduled_at = $1 AND status = 'confirmed'
+       LIMIT 1`,
+      [scheduled_at]
+    )
+    if (conflict.rowCount > 0) {
+      return res.status(409).json({
+        ok: false,
+        error: 'conflict',
+        message: 'That time is already booked. Please pick another slot.'
+      })
+    }
+
+    // Insert appointment
+    const ins = await query(
+      `INSERT INTO appointments (user_id, scheduled_at, status, notes)
+       VALUES ($1, $2, 'confirmed', 'Booked via chatbot')
+       RETURNING id, scheduled_at, status, created_at`,
+      [userId, scheduled_at]
+    )
+
+    // Optional: log confirmation to chat history
+    try {
       await logMessage({
         userId,
         sessionToken: session_id,
@@ -156,25 +186,16 @@ app.post('/api/chatbot/confirm', auth, async (req, res) => {
         content: `Confirmed your appointment for ${scheduled_at}.`,
         meta: { appointment_id: ins.rows[0].id, status: 'confirmed' }
       })
+    } catch {}
 
-      return res.json({ ok: true, status: 'confirmed', appointment: ins.rows[0] })
-    } else {
-      await logMessage({
-        userId,
-        sessionToken: session_id,
-        role: 'assistant',
-        content: `Okay, I will not book that time. When works better?`,
-        meta: { status: 'declined' }
-      })
-      return res.json({ ok: true, status: 'declined' })
-    }
-  } catch (e){
+    return res.json({ ok: true, status: 'confirmed', appointment: ins.rows[0] })
+  } catch (e) {
     console.error(e)
-    return res.status(500).json({ error: 'failed to confirm appointment' })
+    return res.status(500).json({ ok: false, error: 'server_error', message: 'failed to confirm appointment' })
   }
 })
 
-/* ---------- History for a session ---------- */
+/* ---------- History for a session (single definition) ---------- */
 app.get('/api/chat_sessions/:session_id/messages', auth, async (req, res) => {
   try {
     const sessionId = req.params.session_id
@@ -182,21 +203,37 @@ app.get('/api/chat_sessions/:session_id/messages', auth, async (req, res) => {
     const result = await query(
       `SELECT role, content, meta, created_at
        FROM chat_messages
-       WHERE user_id=$1 AND session_token=$2
+       WHERE user_id = $1 AND session_token = $2
        ORDER BY created_at ASC`,
-       [userId, sessionId]
+      [userId, sessionId]
     )
     res.json({ ok: true, messages: result.rows })
-  } catch (e){
+  } catch (e) {
     console.error(e)
-    res.status(500).json({ error: 'failed to fetch messages' })
+    res.status(500).json({ ok: false, error: 'failed_to_fetch_messages' })
+  }
+})
+
+/* ---------- Delete all messages for a session ---------- */
+app.delete('/api/chat_sessions/:session_id/messages', auth, async (req, res) => {
+  try {
+    const sessionId = req.params.session_id
+    const userId = await upsertUser(req.user?.sub || 'user_1')
+    await query(
+      `DELETE FROM chat_messages WHERE user_id = $1 AND session_token = $2`,
+      [userId, sessionId]
+    )
+    res.json({ ok: true, deleted: true })
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({ ok: false, error: 'failed_to_delete_messages' })
   }
 })
 
 /* ---------- Error ---------- */
 app.use((err, _req, res, _next) => {
   console.error('Unexpected error:', err)
-  res.status(500).json({ error: 'server error'})
+  res.status(500).json({ error: 'server error' })
 })
 
 app.listen(PORT, () => console.log(`Backend listening on http://localhost:${PORT}`))
